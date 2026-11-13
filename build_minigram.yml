@@ -1,0 +1,110 @@
+name: Build Minigram
+
+# Jalankan manual: tab Actions -> Build Minigram -> Run workflow
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      TG_API_ID: ${{ secrets.TG_API_ID }}
+      TG_API_HASH: ${{ secrets.TG_API_HASH }}
+      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+      GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+
+    steps:
+      - name: Cek secret wajib
+        run: |
+          if [ -z "$TG_API_ID" ] || [ -z "$TG_API_HASH" ]; then
+            echo "::error::Secret TG_API_ID dan TG_API_HASH wajib diisi (daftar di my.telegram.org). api_id bawaan Telegram tidak boleh dipakai."
+            exit 1
+          fi
+
+      - name: Kosongkan disk runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost || true
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Pasang Android SDK, NDK, CMake
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager --install "platforms;android-36" "build-tools;36.0.0" \
+            "ndk;27.2.12479018" "cmake;3.22.1"
+
+      - name: Terapkan patch Minigram (nama, menu, iklan, bahasa, ikon, arm64)
+        run: |
+          pip install pillow
+          python3 minigram/apply_minigram.py
+
+      - name: Isi api_id dan api_hash
+        run: |
+          F=TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java
+          sed -i -E "s/APP_ID = [0-9]+;/APP_ID = ${TG_API_ID};/" "$F"
+          sed -i -E "s/APP_HASH = \"[0-9a-fA-F]+\";/APP_HASH = \"${TG_API_HASH}\";/" "$F"
+          grep -n "APP_ID =" "$F" | sed -E 's/APP_HASH.*//'
+
+      - name: Google Services (opsional, untuk notifikasi push FCM)
+        run: |
+          if [ -n "$GOOGLE_SERVICES_JSON" ]; then
+            echo "$GOOGLE_SERVICES_JSON" > TMessagesProj_App/google-services.json
+            echo "google-services.json dari secret dipakai."
+          else
+            echo "Tanpa secret GOOGLE_SERVICES_JSON: push FCM tidak aktif, notifikasi memakai koneksi latar belakang."
+          fi
+
+      - name: Siapkan keystore
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > TMessagesProj/config/release.keystore
+            echo "SIGN_STORE_PASS=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "SIGN_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "SIGN_KEY_PASS=$KEY_PASSWORD" >> "$GITHUB_ENV"
+          else
+            echo "::warning::KEYSTORE_BASE64 kosong, memakai kunci SEMENTARA. APK tidak bisa di-update di atas versi build sebelumnya (tanda tangan berbeda)."
+            rm -f TMessagesProj/config/release.keystore
+            keytool -genkeypair -v -keystore TMessagesProj/config/release.keystore \
+              -storepass android -alias androidkey -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Minigram"
+            echo "SIGN_STORE_PASS=android" >> "$GITHUB_ENV"
+            echo "SIGN_ALIAS=androidkey" >> "$GITHUB_ENV"
+            echo "SIGN_KEY_PASS=android" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build APK (arm64-v8a)
+        run: |
+          ./gradlew :TMessagesProj_App:assembleAfatRelease \
+            -PRELEASE_STORE_PASSWORD="$SIGN_STORE_PASS" \
+            -PRELEASE_KEY_ALIAS="$SIGN_ALIAS" \
+            -PRELEASE_KEY_PASSWORD="$SIGN_KEY_PASS" \
+            --stacktrace
+
+      - name: Ganti nama APK
+        run: |
+          mkdir -p out
+          APK=$(find TMessagesProj_App/build/outputs/apk -name "*.apk" | head -n 1)
+          echo "APK: $APK"
+          cp "$APK" out/Minigram-arm64.apk
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Minigram-arm64
+          path: out/Minigram-arm64.apk
+          retention-days: 30
