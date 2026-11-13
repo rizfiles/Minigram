@@ -51,7 +51,7 @@ jobs:
       - name: Terapkan patch Minigram (nama, menu, iklan, bahasa, ikon, arm64)
         run: |
           pip install pillow
-          python3 minigram/apply_minigram.py
+          python3 .github/workflows/apply_minigram.py
 
       - name: Isi api_id dan api_hash
         run: |
